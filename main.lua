@@ -1,7 +1,7 @@
 local api = require("api")
 local enhanced_x_up = {
     name = "Enhanced X UP",
-    version = "1.0",
+    version = "1.1",
     author = "Yuck",
     desc = "Raid recruitment with player blacklist."
 }
@@ -33,7 +33,8 @@ local state = {
     blocklist = {},
     recruit_message = "",
     is_recruiting = false,
-    canvas_width = 0
+    canvas_width = 0,
+    event_handler = nil  -- Store the event handler reference
 }
 
 -- Widget references
@@ -271,34 +272,39 @@ local function ExportBlocklist()
 end
 
 
--- RECRUITMENT CONTROL
+-- RECRUITMENT FUNCTIONS
 
 
 local function StartRecruiting()
-    local msg = widgets.recruit_textfield:GetText()
-    if not msg or msg == "" then
-        LogError(MSG_PREFIX_RECRUIT .. "Please enter a recruit message.")
-        return false
+    local message_text = widgets.recruit_textfield:GetText()
+    if message_text == "" then
+        LogError(MSG_PREFIX_RECRUIT .. "Please enter a recruitment message.")
+        return
     end
 
+    state.recruit_message = GetLowerName(message_text)
     state.is_recruiting = true
-    state.recruit_message = GetLowerName(msg)
 
-    widgets.recruit_button:SetText("Stop Recruiting")
-    widgets.recruit_textfield:Enable(false)
     widgets.recruit_canvas:Show(true)
+    widgets.recruit_button:SetText("Recruiting...")
+    widgets.recruit_button:Enable(false)
+    widgets.recruit_textfield:Enable(false)
+    widgets.filter_dropdown:Enable(false)
+    widgets.dms_only:Enable(false)
 
-    LogInfo(MSG_PREFIX_RECRUIT .. "Now recruiting for: " .. msg)
-    return true
+    LogInfo(MSG_PREFIX_RECRUIT .. "Started recruiting. Message: '" .. message_text .. "'")
 end
 
 local function StopRecruiting()
     state.is_recruiting = false
     state.recruit_message = ""
 
-    widgets.recruit_button:SetText("Start Recruiting")
-    widgets.recruit_textfield:Enable(true)
     widgets.recruit_canvas:Show(false)
+    widgets.recruit_button:SetText("Start Recruiting")
+    widgets.recruit_button:Enable(true)
+    widgets.recruit_textfield:Enable(true)
+    widgets.filter_dropdown:Enable(true)
+    widgets.dms_only:Enable(true)
 
     LogInfo(MSG_PREFIX_RECRUIT .. "Stopped recruiting.")
 end
@@ -312,73 +318,93 @@ local function ToggleRecruiting()
 end
 
 
--- BLACKLIST WINDOW CREATION
+-- BLACKLIST WINDOW UI
 
 
 local function CreateBlacklistWindow()
-    local window = api.Interface:CreateWindow("blacklistWindow", "Blacklist Manager", 0, 0)
-    window:SetExtent(420, 460)
+    local window = api.Interface:CreateEmptyWindow("blacklistWindow")
+    window:SetExtent(420, 450)
     window:AddAnchor("CENTER", "UIParent", 0, 0)
+    window:SetTitle("Player Blacklist")
     window:Show(false)
     widgets.blacklist_window = window
 
-    -- Instruction stuff
-    local instructions = window:CreateChildWidget("label", "instructions", 0, true)
-    instructions:SetText("Add players to prevent raid invites")
-    instructions:SetExtent(380, 20)
-    instructions:AddAnchor("TOPLEFT", window, 20, 50)
+    -- Background
+    local bg = window:CreateNinePartDrawable(TEXTURE_PATH.HUD, "background")
+    bg:SetTextureInfo("bg_quest")
+    bg:SetColor(0, 0, 0, 0.8)
+    bg:AddAnchor("TOPLEFT", window, 0, 0)
+    bg:AddAnchor("BOTTOMRIGHT", window, 0, 0)
 
-    -- blacklist input
-    local player_label = window:CreateChildWidget("label", "player_label", 0, true)
-    player_label:SetText("Player Name:")
-    player_label:SetExtent(100, 20)
-    player_label:AddAnchor("TOP", window, 0, 80)
+    -- Title bar
+    local title = window:CreateChildWidget("label", "title", 0, true)
+    title:SetExtent(400, 30)
+    title:AddAnchor("TOP", window, 0, 10)
+    title:SetText("Player Blacklist Manager")
+    title:SetAlign(ALIGN.CENTER)
+    ApplyTextColor(title, FONT_COLOR.TITLE)
+    title:Show(true)
 
-    -- Total width: input(200) + gap(10) + button(100) = 310px
-    -- Center by anchoring to window center and offsetting left by half the group width
-    local input = W_CTRL.CreateEdit("blacklist_input", window)
-    input:SetExtent(200, 30)
-    input:AddAnchor("CENTER", window, -55, -110)
-    input:SetMaxTextLength(32)
-    input:Show(true)
-    widgets.blacklist_input = input
+    -- Close button
+    local close_button = window:CreateChildWidget("button", "close_button", 0, true)
+    close_button:SetText("X")
+    close_button:SetExtent(30, 30)
+    close_button:AddAnchor("TOPRIGHT", window, -10, 10)
+    api.Interface:ApplyButtonSkin(close_button, BUTTON_BASIC.DEFAULT)
+    close_button:SetHandler("OnClick", function()
+        window:Show(false)
+    end)
 
-    local add_button = window:CreateChildWidget("button", "add_player_button", 0, true)
-    add_button:SetText("Add Player")
+    -- Input section
+    local input_label = window:CreateChildWidget("label", "input_label", 0, true)
+    input_label:SetExtent(400, 20)
+    input_label:AddAnchor("TOPLEFT", window, 20, 50)
+    input_label:SetText("Add Player to Blacklist:")
+    input_label:Show(true)
+
+    local input_field = W_CTRL.CreateEdit("blacklist_input", window)
+    input_field:SetExtent(250, 30)
+    input_field:AddAnchor("TOPLEFT", window, 20, 75)
+    input_field:SetMaxTextLength(32)
+    input_field:CreateGuideText("Player Name")
+    input_field:Show(true)
+    widgets.blacklist_input = input_field
+
+    local add_button = window:CreateChildWidget("button", "add_button", 0, true)
+    add_button:SetText("Add")
     add_button:SetExtent(100, 30)
-    add_button:AddAnchor("LEFT", input, "RIGHT", 10, 0)
+    add_button:AddAnchor("LEFT", input_field, "RIGHT", 10, 0)
     api.Interface:ApplyButtonSkin(add_button, BUTTON_BASIC.DEFAULT)
 
     add_button:SetHandler("OnClick", function()
-        local name = input:GetText()
-        if not name or name == "" then
+        local player_name = input_field:GetText()
+        if player_name == "" then
             LogError(MSG_PREFIX_BLACKLIST .. "Please enter a player name.")
             return
         end
 
-        local success, message = AddToBlocklist(name)
+        local success, message = AddToBlocklist(player_name)
         if success then
+            input_field:SetText("")
             UpdateBlacklistDisplay()
-            input:SetText("")
             LogInfo(MSG_PREFIX_BLACKLIST .. message)
         else
             LogError(MSG_PREFIX_BLACKLIST .. message)
         end
     end)
 
-    -- Blacklist display
+    -- List section
     local list_label = window:CreateChildWidget("label", "list_label", 0, true)
-    list_label:SetText("Current Blacklist:")
-    list_label:SetExtent(300, 20)
-    list_label:AddAnchor("TOPLEFT", window, 20, 150)
+    list_label:SetExtent(400, 20)
+    list_label:AddAnchor("TOPLEFT", window, 20, 120)
+    list_label:SetText("Blacklisted Players:")
+    list_label:Show(true)
 
-    -- Create a simple frame to hold the player names
-    local list_frame = window:CreateChildWidget("emptywidget", "list_frame", 0, true)
-    list_frame:SetExtent(380, 180)
-    list_frame:AddAnchor("TOPLEFT", window, 20, 175)
-    list_frame:Show(true)
-
-    widgets.blacklist_listbox = list_frame
+    local listbox = window:CreateChildWidget("emptywidget", "listbox", 0, true)
+    listbox:SetExtent(380, 220)
+    listbox:AddAnchor("TOPLEFT", window, 20, 145)
+    listbox.player_widgets = {}
+    widgets.blacklist_listbox = listbox
 
     -- Bottom buttons (centered and lowered to prevent overlap)
     -- Window width: 420px
@@ -614,12 +640,16 @@ local function OnLoad()
     blacklist_button:SetHandler("OnClick", ToggleBlacklistWindow)
     widgets.blacklist_button = blacklist_button
 
-    -- Register event handler
-    api.On("CHAT_MESSAGE", OnChatMessage)
+    -- Register event handler and store reference
+    state.event_handler = OnChatMessage
+    api.On("CHAT_MESSAGE", state.event_handler)
 end
 
 local function OnUnload()
-    api.Off("CHAT_MESSAGE", OnChatMessage)
+    -- Since the API doesn't have an Off method, we simply set the recruiting state to false
+    -- The event handler will still be called but will return early due to the state check
+    state.is_recruiting = false
+    state.event_handler = nil
 
     if widgets.recruit_button then
         widgets.recruit_button:Show(false)
