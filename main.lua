@@ -1,7 +1,7 @@
 local api = require("api")
 local enhanced_x_up = {
     name = "Enhanced X UP",
-    version = "1.1",
+    version = "1.2",
     author = "Yuck",
     desc = "Raid recruitment with player blacklist."
 }
@@ -30,11 +30,11 @@ local NAME_CACHE_MAX_SIZE = 1000
 
 
 local state = {
-    blocklist = {},
+    blocklist = {},         -- Ordered list for saving/UI
+    blocklist_lookup = {},  -- [OPTIMIZATION] Hash map for O(1) instant checking
     recruit_message = "",
     is_recruiting = false,
-    canvas_width = 0,
-    event_handler = nil  -- Store the event handler reference
+    canvas_width = 0
 }
 
 -- Widget references
@@ -61,13 +61,15 @@ local name_cache_size = 0
 
 
 local function GetLowerName(name)
+    if not name then return "" end
     local cached = name_cache[name]
     if cached then
         return cached
     end
 
     if name_cache_size >= NAME_CACHE_MAX_SIZE then
-        ClearNameCache()
+        name_cache = {}
+        name_cache_size = 0
     end
 
     local lower = string.lower(name)
@@ -89,6 +91,15 @@ local function LogError(message)
     api.Log:Err(message)
 end
 
+-- [OPTIMIZATION] Rebuild the hash map from the array list
+local function RebuildLookup()
+    state.blocklist_lookup = {}
+    for i = 1, #state.blocklist do
+        local name = state.blocklist[i]
+        state.blocklist_lookup[GetLowerName(name)] = true
+    end
+end
+
 
 -- BLACKLIST CORE FUNCTIONS
 
@@ -104,15 +115,8 @@ local function SaveBlocklist()
 end
 
 local function IsBlacklisted(name)
-    local lower_name = GetLowerName(name)
-    local blocklist = state.blocklist
-
-    for i = 1, #blocklist do
-        if GetLowerName(blocklist[i]) == lower_name then
-            return true
-        end
-    end
-    return false
+    -- [OPTIMIZATION] Instant lookup
+    return state.blocklist_lookup[GetLowerName(name)] == true
 end
 
 local function AddToBlocklist(name)
@@ -120,7 +124,11 @@ local function AddToBlocklist(name)
         return false, name .. " is already blacklisted."
     end
 
+    -- Add to Array
     state.blocklist[#state.blocklist + 1] = name
+    -- Add to Lookup
+    state.blocklist_lookup[GetLowerName(name)] = true
+
     SaveBlocklist()
     return true, "Added player: " .. name
 end
@@ -132,6 +140,10 @@ local function RemoveFromBlocklist(name)
     for i = #blocklist, 1, -1 do
         if GetLowerName(blocklist[i]) == lower_name then
             table.remove(blocklist, i)
+
+            -- Remove from Lookup
+            state.blocklist_lookup[lower_name] = nil
+
             SaveBlocklist()
             ClearNameCache()
             return true, "Removed: " .. name
@@ -146,6 +158,7 @@ local function ClearBlocklist()
     end
 
     state.blocklist = {}
+    state.blocklist_lookup = {}
     SaveBlocklist()
     ClearNameCache()
     return true, "All entries cleared."
@@ -177,7 +190,6 @@ local function UpdateBlacklistDisplay()
     local count = #blocklist
 
     if count == 0 then
-        -- Show "no entries" message
         local empty_label = frame:CreateChildWidget("label", "empty_msg", 0, true)
         empty_label:SetText("(No entries)")
         empty_label:SetExtent(380, 20)
@@ -187,26 +199,22 @@ local function UpdateBlacklistDisplay()
         return
     end
 
-    -- Create label + button for each player (max 5 visible to fit in window), eventually gonna change this.
     local visible_count = math.min(count, 5)
     for i = 1, visible_count do
         local y_offset = (i - 1) * 35
 
-        -- Player name label
         local name_label = frame:CreateChildWidget("label", "player_" .. i, 0, true)
         name_label:SetText(blocklist[i])
         name_label:SetExtent(240, 25)
         name_label:AddAnchor("TOPLEFT", frame, 5, y_offset + 5)
         name_label:Show(true)
 
-        -- Remove button
         local remove_btn = frame:CreateChildWidget("button", "remove_" .. i, 0, true)
         remove_btn:SetText("Remove")
         remove_btn:SetExtent(80, 25)
         remove_btn:AddAnchor("LEFT", name_label, "RIGHT", 10, 0)
         api.Interface:ApplyButtonSkin(remove_btn, BUTTON_BASIC.DEFAULT)
 
-        -- Store the player name for removal
         remove_btn.playerName = blocklist[i]
         remove_btn:SetHandler("OnClick", function(self)
             local success, message = RemoveFromBlocklist(self.playerName)
@@ -222,7 +230,6 @@ local function UpdateBlacklistDisplay()
         frame.player_widgets[i] = {label = name_label, button = remove_btn}
     end
 
-    -- Show count if more than 5 entries
     if count > 5 then
         local more_label = frame:CreateChildWidget("label", "more_msg", 0, true)
         more_label:SetText("... and " .. (count - 5) .. " more (use Export/Import)")
@@ -250,6 +257,7 @@ local function ImportBlocklist()
         local entry = imported_list[i]
         if not IsBlacklisted(entry) then
             blocklist[#blocklist + 1] = entry
+            state.blocklist_lookup[GetLowerName(entry)] = true
             added_count = added_count + 1
         end
     end
@@ -272,39 +280,35 @@ local function ExportBlocklist()
 end
 
 
--- RECRUITMENT FUNCTIONS
+-- RECRUITMENT CONTROL
 
 
 local function StartRecruiting()
-    local message_text = widgets.recruit_textfield:GetText()
-    if message_text == "" then
-        LogError(MSG_PREFIX_RECRUIT .. "Please enter a recruitment message.")
-        return
+    local msg = widgets.recruit_textfield:GetText()
+    if not msg or msg == "" then
+        LogError(MSG_PREFIX_RECRUIT .. "Please enter a recruit message.")
+        return false
     end
 
-    state.recruit_message = GetLowerName(message_text)
     state.is_recruiting = true
+    -- Store recruit message in lower case for insensitive matching
+    state.recruit_message = GetLowerName(msg)
 
-    widgets.recruit_canvas:Show(true)
-    widgets.recruit_button:SetText("Recruiting...")
-    widgets.recruit_button:Enable(false)
+    widgets.recruit_button:SetText("Stop Recruiting")
     widgets.recruit_textfield:Enable(false)
-    widgets.filter_dropdown:Enable(false)
-    widgets.dms_only:Enable(false)
+    widgets.recruit_canvas:Show(true)
 
-    LogInfo(MSG_PREFIX_RECRUIT .. "Started recruiting. Message: '" .. message_text .. "'")
+    LogInfo(MSG_PREFIX_RECRUIT .. "Now recruiting for: " .. msg)
+    return true
 end
 
 local function StopRecruiting()
     state.is_recruiting = false
     state.recruit_message = ""
 
-    widgets.recruit_canvas:Show(false)
     widgets.recruit_button:SetText("Start Recruiting")
-    widgets.recruit_button:Enable(true)
     widgets.recruit_textfield:Enable(true)
-    widgets.filter_dropdown:Enable(true)
-    widgets.dms_only:Enable(true)
+    widgets.recruit_canvas:Show(false)
 
     LogInfo(MSG_PREFIX_RECRUIT .. "Stopped recruiting.")
 end
@@ -318,98 +322,67 @@ local function ToggleRecruiting()
 end
 
 
--- BLACKLIST WINDOW UI
+-- BLACKLIST WINDOW CREATION
 
 
 local function CreateBlacklistWindow()
-    local window = api.Interface:CreateEmptyWindow("blacklistWindow")
-    window:SetExtent(420, 450)
+    local window = api.Interface:CreateWindow("blacklistWindow", "Blacklist Manager", 0, 0)
+    window:SetExtent(420, 460)
     window:AddAnchor("CENTER", "UIParent", 0, 0)
-    window:SetTitle("Player Blacklist")
     window:Show(false)
     widgets.blacklist_window = window
 
-    -- Background
-    local bg = window:CreateNinePartDrawable(TEXTURE_PATH.HUD, "background")
-    bg:SetTextureInfo("bg_quest")
-    bg:SetColor(0, 0, 0, 0.8)
-    bg:AddAnchor("TOPLEFT", window, 0, 0)
-    bg:AddAnchor("BOTTOMRIGHT", window, 0, 0)
+    local instructions = window:CreateChildWidget("label", "instructions", 0, true)
+    instructions:SetText("Add players to prevent raid invites")
+    instructions:SetExtent(380, 20)
+    instructions:AddAnchor("TOPLEFT", window, 20, 50)
 
-    -- Title bar
-    local title = window:CreateChildWidget("label", "title", 0, true)
-    title:SetExtent(400, 30)
-    title:AddAnchor("TOP", window, 0, 10)
-    title:SetText("Player Blacklist Manager")
-    title:SetAlign(ALIGN.CENTER)
-    ApplyTextColor(title, FONT_COLOR.TITLE)
-    title:Show(true)
+    local player_label = window:CreateChildWidget("label", "player_label", 0, true)
+    player_label:SetText("Player Name:")
+    player_label:SetExtent(100, 20)
+    player_label:AddAnchor("TOP", window, 0, 80)
 
-    -- Close button
-    local close_button = window:CreateChildWidget("button", "close_button", 0, true)
-    close_button:SetText("X")
-    close_button:SetExtent(30, 30)
-    close_button:AddAnchor("TOPRIGHT", window, -10, 10)
-    api.Interface:ApplyButtonSkin(close_button, BUTTON_BASIC.DEFAULT)
-    close_button:SetHandler("OnClick", function()
-        window:Show(false)
-    end)
+    local input = W_CTRL.CreateEdit("blacklist_input", window)
+    input:SetExtent(200, 30)
+    input:AddAnchor("CENTER", window, -55, -110)
+    input:SetMaxTextLength(32)
+    input:Show(true)
+    widgets.blacklist_input = input
 
-    -- Input section
-    local input_label = window:CreateChildWidget("label", "input_label", 0, true)
-    input_label:SetExtent(400, 20)
-    input_label:AddAnchor("TOPLEFT", window, 20, 50)
-    input_label:SetText("Add Player to Blacklist:")
-    input_label:Show(true)
-
-    local input_field = W_CTRL.CreateEdit("blacklist_input", window)
-    input_field:SetExtent(250, 30)
-    input_field:AddAnchor("TOPLEFT", window, 20, 75)
-    input_field:SetMaxTextLength(32)
-    input_field:CreateGuideText("Player Name")
-    input_field:Show(true)
-    widgets.blacklist_input = input_field
-
-    local add_button = window:CreateChildWidget("button", "add_button", 0, true)
-    add_button:SetText("Add")
+    local add_button = window:CreateChildWidget("button", "add_player_button", 0, true)
+    add_button:SetText("Add Player")
     add_button:SetExtent(100, 30)
-    add_button:AddAnchor("LEFT", input_field, "RIGHT", 10, 0)
+    add_button:AddAnchor("LEFT", input, "RIGHT", 10, 0)
     api.Interface:ApplyButtonSkin(add_button, BUTTON_BASIC.DEFAULT)
 
     add_button:SetHandler("OnClick", function()
-        local player_name = input_field:GetText()
-        if player_name == "" then
+        local name = input:GetText()
+        if not name or name == "" then
             LogError(MSG_PREFIX_BLACKLIST .. "Please enter a player name.")
             return
         end
 
-        local success, message = AddToBlocklist(player_name)
+        local success, message = AddToBlocklist(name)
         if success then
-            input_field:SetText("")
             UpdateBlacklistDisplay()
+            input:SetText("")
             LogInfo(MSG_PREFIX_BLACKLIST .. message)
         else
             LogError(MSG_PREFIX_BLACKLIST .. message)
         end
     end)
 
-    -- List section
     local list_label = window:CreateChildWidget("label", "list_label", 0, true)
-    list_label:SetExtent(400, 20)
-    list_label:AddAnchor("TOPLEFT", window, 20, 120)
-    list_label:SetText("Blacklisted Players:")
-    list_label:Show(true)
+    list_label:SetText("Current Blacklist:")
+    list_label:SetExtent(300, 20)
+    list_label:AddAnchor("TOPLEFT", window, 20, 150)
 
-    local listbox = window:CreateChildWidget("emptywidget", "listbox", 0, true)
-    listbox:SetExtent(380, 220)
-    listbox:AddAnchor("TOPLEFT", window, 20, 145)
-    listbox.player_widgets = {}
-    widgets.blacklist_listbox = listbox
+    local list_frame = window:CreateChildWidget("emptywidget", "list_frame", 0, true)
+    list_frame:SetExtent(380, 180)
+    list_frame:AddAnchor("TOPLEFT", window, 20, 175)
+    list_frame:Show(true)
+    widgets.blacklist_listbox = list_frame
 
-    -- Bottom buttons (centered and lowered to prevent overlap)
-    -- Window width: 420px
-    -- Button group width: 90 + 10 + 90 + 10 + 90 = 290px
-    -- Center position: (420 - 290) / 2 = 65px from left
     local clear_button = window:CreateChildWidget("button", "clear_button", 0, true)
     clear_button:SetText("Clear All")
     clear_button:SetExtent(90, 30)
@@ -477,35 +450,34 @@ end
 
 
 local function OnChatMessage(channelId, speakerId, _, speakerName, message)
-    -- WE EXIT FAST AF
     if not state.is_recruiting or not speakerName or state.recruit_message == "" then
         return
     end
 
-    -- Normalize message once
+    -- Normalize message to lowercase for case-insensitive matching
     local normalized_message = GetLowerName(message)
-    local recruit_message = state.recruit_message
+    local recruit_message = state.recruit_message -- Already lowercase
 
-    -- Filter check - verify message matches first
+    -- Filter check
     local filter_selection = widgets.filter_dropdown.selctedIndex
     local message_matches = false
 
     if filter_selection == FILTER_EQUALS then
         message_matches = (normalized_message == recruit_message)
     elseif filter_selection == FILTER_CONTAINS then
+        -- string.find with 'true' for 4th arg prevents regex magic characters, checks for literal string
+        -- Since both inputs are lowercase, this is case-insensitive
         message_matches = (string.find(normalized_message, recruit_message, 1, true) ~= nil)
     elseif filter_selection == FILTER_STARTS_WITH then
         message_matches = (string.sub(normalized_message, 1, #recruit_message) == recruit_message)
     end
 
-    -- Only proceed if message matches
     if not message_matches then
         return
     end
 
-    -- Now check blacklist (only for matching messages)
+    -- Check Blacklist (Optimized O(1))
     if IsBlacklisted(speakerName) then
-        LogInfo(MSG_PREFIX_RECRUIT .. "Blocked " .. speakerName .. " (player blacklisted)")
         return
     end
 
@@ -522,13 +494,17 @@ local function OnChatMessage(channelId, speakerId, _, speakerName, message)
     end
 
     if should_invite then
-        LogInfo(MSG_PREFIX_RECRUIT .. "Inviting " .. speakerName)
-        api.Team:InviteToTeam(speakerName, false)
+        -- Check if already in team to avoid spam
+        local existingMemberIndex = api.Team:GetMemberIndexByName(speakerName)
+        if not existingMemberIndex then
+            LogInfo(MSG_PREFIX_RECRUIT .. "Inviting " .. speakerName)
+            api.Team:InviteToTeam(speakerName, false)
+        end
     end
 end
 
 
--- DRAG HANDLERS (defined once + reused)
+-- DRAG HANDLERS
 
 
 local function OnCanvasDragStart(self)
@@ -549,7 +525,6 @@ end
 
 
 local function OnLoad()
-    -- Load settings
     local settings = api.GetSettings("enhanced_x_up")
     if not settings.blocklist then
         settings.blocklist = {}
@@ -558,6 +533,7 @@ local function OnLoad()
     end
 
     state.blocklist = settings.blocklist
+    RebuildLookup()
 
     -- Auto-import
     local success, message = ImportBlocklist()
@@ -565,7 +541,7 @@ local function OnLoad()
         LogInfo(MSG_PREFIX_BLACKLIST .. "Auto-imported entries from file.")
     end
 
-    -- Create recruit canvas
+    -- Recruit canvas
     local canvas = api.Interface:CreateEmptyWindow("recruitWindow")
     canvas:AddAnchor("CENTER", "UIParent", 0, 50)
     canvas:SetExtent(200, 100)
@@ -589,13 +565,12 @@ local function OnLoad()
     canvas:SetHandler("OnDragStop", OnCanvasDragStop)
     canvas:EnableDrag(true)
 
-    -- Setup raid manager UI
+    -- Raid Manager UI Hook
     local raid_manager = ADDON:GetContent(UIC.RAID_MANAGER)
     state.canvas_width = raid_manager:GetWidth()
     raid_manager:SetExtent(state.canvas_width, 510)
     widgets.raid_manager = raid_manager
 
-    -- Recruit button
     local recruit_button = raid_manager:CreateChildWidget("button", "raid_setup_button", 0, true)
     recruit_button:SetExtent(105, 30)
     recruit_button:AddAnchor("LEFT", raid_manager, 20, 140)
@@ -604,7 +579,6 @@ local function OnLoad()
     recruit_button:SetHandler("OnClick", ToggleRecruiting)
     widgets.recruit_button = recruit_button
 
-    -- Recruit textfield
     local textfield = W_CTRL.CreateEdit("recruit_message", raid_manager)
     textfield:AddAnchor("LEFT", raid_manager, 131, 140)
     textfield:SetExtent(150, 30)
@@ -613,16 +587,15 @@ local function OnLoad()
     textfield:Show(true)
     widgets.recruit_textfield = textfield
 
-    -- Filter dropdown
     local filter = api.Interface:CreateComboBox(raid_manager)
     filter:SetExtent(100, 30)
     filter:AddAnchor("LEFT", raid_manager, 285, 140)
     filter.dropdownItem = {"Equals", "Contains", "Starts With"}
-    filter:Select(1)
+    -- Default selected index set to 2 (Contains) per request
+    filter:Select(2)
     filter:Show(true)
     widgets.filter_dropdown = filter
 
-    -- Chat source dropdown
     local dms = api.Interface:CreateComboBox(raid_manager)
     dms:SetExtent(100, 30)
     dms:AddAnchor("LEFT", raid_manager, 390, 140)
@@ -631,7 +604,6 @@ local function OnLoad()
     dms:Show(true)
     widgets.dms_only = dms
 
-    -- Blacklist button
     local blacklist_button = raid_manager:CreateChildWidget("button", "blacklist_button", 0, true)
     blacklist_button:SetExtent(150, 30)
     blacklist_button:AddAnchor("LEFT", raid_manager, 20, 180)
@@ -640,16 +612,11 @@ local function OnLoad()
     blacklist_button:SetHandler("OnClick", ToggleBlacklistWindow)
     widgets.blacklist_button = blacklist_button
 
-    -- Register event handler and store reference
-    state.event_handler = OnChatMessage
-    api.On("CHAT_MESSAGE", state.event_handler)
+    api.On("CHAT_MESSAGE", OnChatMessage)
 end
 
 local function OnUnload()
-    -- Since the API doesn't have an Off method, we simply set the recruiting state to false
-    -- The event handler will still be called but will return early due to the state check
-    state.is_recruiting = false
-    state.event_handler = nil
+    api.Off("CHAT_MESSAGE", OnChatMessage)
 
     if widgets.recruit_button then
         widgets.recruit_button:Show(false)
@@ -668,12 +635,8 @@ local function OnUnload()
         widgets.blacklist_window:Show(false)
     end
 
-    -- Clear cache on unload
     ClearNameCache()
 end
-
-
--- ADDON REGISTRATION
 
 
 enhanced_x_up.OnLoad = OnLoad
