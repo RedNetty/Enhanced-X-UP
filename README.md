@@ -17,7 +17,3 @@ Enhanced X UP automates raid recruitment by monitoring chat messages and automat
 ## Author
 
 Created by Yuck
-
-## Version
-
-1.0
